@@ -21,6 +21,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.cli_args import make_arg_parser
+
 # yapf conflicts with isort for this block
 # yapf: disable
 from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
@@ -35,12 +36,21 @@ from vllm.entrypoints.openai.protocol import (ChatCompletionRequest,
 from vllm.entrypoints.openai.serving_chat import OpenAIServingChat
 from vllm.entrypoints.openai.serving_completion import OpenAIServingCompletion
 from vllm.entrypoints.openai.serving_embedding import OpenAIServingEmbedding
-from vllm.entrypoints.openai.serving_tokenization import (
-    OpenAIServingTokenization)
+from vllm.entrypoints.openai.serving_tokenization import OpenAIServingTokenization
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import FlexibleArgumentParser
 from vllm.version import __version__ as VLLM_VERSION
+
+from fastapi.exceptions import HTTPException
+from limits import RateLimitItemPerMinute
+from limits.storage import MemoryStorage
+from limits.strategies import FixedWindowRateLimiter
+
+# Set up rate limiting
+rate_limit_storage = MemoryStorage()
+rate_limiter = FixedWindowRateLimiter(rate_limit_storage)
+rate_limit = RateLimitItemPerMinute(10)
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
 
@@ -51,7 +61,7 @@ openai_serving_completion: OpenAIServingCompletion
 openai_serving_embedding: OpenAIServingEmbedding
 openai_serving_tokenization: OpenAIServingTokenization
 
-logger = init_logger('vllm.entrypoints.openai.api_server')
+logger = init_logger("vllm.entrypoints.openai.api_server")
 
 _running_tasks: Set[asyncio.Task] = set()
 
@@ -79,7 +89,7 @@ def mount_metrics(app: fastapi.FastAPI):
     # Add prometheus asgi middleware to route /metrics requests
     metrics_route = Mount("/metrics", make_asgi_app())
     # Workaround for 307 Redirect for /metrics
-    metrics_route.path_regex = re.compile('^/metrics(?P<path>.*)$')
+    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
     app.routes.append(metrics_route)
 
 
@@ -94,8 +104,7 @@ async def health() -> Response:
 async def tokenize(request: TokenizeRequest):
     generator = await openai_serving_tokenization.create_tokenize(request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     else:
         assert isinstance(generator, TokenizeResponse)
         return JSONResponse(content=generator.model_dump())
@@ -105,8 +114,7 @@ async def tokenize(request: TokenizeRequest):
 async def detokenize(request: DetokenizeRequest):
     generator = await openai_serving_tokenization.create_detokenize(request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     else:
         assert isinstance(generator, DetokenizeResponse)
         return JSONResponse(content=generator.model_dump())
@@ -125,16 +133,12 @@ async def show_version():
 
 
 @router.post("/v1/chat/completions")
-async def create_chat_completion(request: ChatCompletionRequest,
-                                 raw_request: Request):
-    generator = await openai_serving_chat.create_chat_completion(
-        request, raw_request)
+async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    generator = await openai_serving_chat.create_chat_completion(request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     if request.stream:
-        return StreamingResponse(content=generator,
-                                 media_type="text/event-stream")
+        return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
         assert isinstance(generator, ChatCompletionResponse)
         return JSONResponse(content=generator.model_dump())
@@ -142,25 +146,20 @@ async def create_chat_completion(request: ChatCompletionRequest,
 
 @router.post("/v1/completions")
 async def create_completion(request: CompletionRequest, raw_request: Request):
-    generator = await openai_serving_completion.create_completion(
-        request, raw_request)
+    generator = await openai_serving_completion.create_completion(request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     if request.stream:
-        return StreamingResponse(content=generator,
-                                 media_type="text/event-stream")
+        return StreamingResponse(content=generator, media_type="text/event-stream")
     else:
         return JSONResponse(content=generator.model_dump())
 
 
 @router.post("/v1/embeddings")
 async def create_embedding(request: EmbeddingRequest, raw_request: Request):
-    generator = await openai_serving_embedding.create_embedding(
-        request, raw_request)
+    generator = await openai_serving_embedding.create_embedding(request, raw_request)
     if isinstance(generator, ErrorResponse):
-        return JSONResponse(content=generator.model_dump(),
-                            status_code=generator.code)
+        return JSONResponse(content=generator.model_dump(), status_code=generator.code)
     else:
         return JSONResponse(content=generator.model_dump())
 
@@ -180,11 +179,20 @@ def build_app(args):
         allow_headers=args.allowed_headers,
     )
 
+    @app.middleware("http")
+    async def rate_limit_middleware(request: Request, call_next):
+        client_ip = request.client.host
+        if not rate_limiter.hit(rate_limit, client_ip):
+            return JSONResponse(
+                status_code=429, content={"detail": "Rate limit exceeded"}
+            )
+        response = await call_next(request)
+        return response
+
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(_, exc):
         err = openai_serving_chat.create_error_response(message=str(exc))
-        return JSONResponse(err.model_dump(),
-                            status_code=HTTPStatus.BAD_REQUEST)
+        return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
     if token := envs.VLLM_API_KEY or args.api_key:
 
@@ -196,8 +204,7 @@ def build_app(args):
             if not request.url.path.startswith(f"{root_path}/v1"):
                 return await call_next(request)
             if request.headers.get("Authorization") != "Bearer " + token:
-                return JSONResponse(content={"error": "Unauthorized"},
-                                    status_code=401)
+                return JSONResponse(content={"error": "Unauthorized"}, status_code=401)
             return await call_next(request)
 
     for middleware in args.middleware:
@@ -208,8 +215,9 @@ def build_app(args):
         elif inspect.iscoroutinefunction(imported):
             app.middleware("http")(imported)
         else:
-            raise ValueError(f"Invalid middleware {middleware}. "
-                             f"Must be a function or a class.")
+            raise ValueError(
+                f"Invalid middleware {middleware}. " f"Must be a function or a class."
+            )
 
     return app
 
@@ -229,9 +237,13 @@ async def build_server(
     global engine, engine_args
 
     engine_args = AsyncEngineArgs.from_cli_args(args)
-    engine = (llm_engine
-              if llm_engine is not None else AsyncLLMEngine.from_engine_args(
-                  engine_args, usage_context=UsageContext.OPENAI_API_SERVER))
+    engine = (
+        llm_engine
+        if llm_engine is not None
+        else AsyncLLMEngine.from_engine_args(
+            engine_args, usage_context=UsageContext.OPENAI_API_SERVER
+        )
+    )
 
     model_config = await engine.get_model_config()
 
@@ -283,9 +295,9 @@ async def build_server(
 
     logger.info("Available routes are:")
     for route in app.routes:
-        if not hasattr(route, 'methods'):
+        if not hasattr(route, "methods"):
             continue
-        methods = ', '.join(route.methods)
+        methods = ", ".join(route.methods)
         logger.info("Route: %s, Methods: %s", route.path, methods)
 
     config = uvicorn.Config(
@@ -336,7 +348,8 @@ if __name__ == "__main__":
     # NOTE(simon):
     # This section should be in sync with vllm/scripts.py for CLI entrypoints.
     parser = FlexibleArgumentParser(
-        description="vLLM OpenAI-Compatible RESTful API server.")
+        description="vLLM OpenAI-Compatible RESTful API server."
+    )
     parser = make_arg_parser(parser)
     args = parser.parse_args()
     asyncio.run(run_server(args))
